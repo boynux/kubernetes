@@ -889,3 +889,46 @@ func TestOverlappingRCs(t *testing.T) {
 		}
 	}
 }
+
+func TestCacheGetPodControllers(t *testing.T) {
+	client := client.NewOrDie(&client.Config{Host: "", GroupVersion: testapi.Default.GroupVersion()})
+	manager := NewReplicationManager(client, controller.NoResyncPeriodFunc, BurstReplicas)
+
+	pods := []api.Pod{}
+	for i := 0; i < 100; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		for j := 0; j < 10; j++ {
+			rcName := fmt.Sprintf("rc-%d", j)
+			for k := 0; k < 10; k++ {
+				podName := fmt.Sprintf("pod-%d-%d", j, k)
+				pods = append(pods, api.Pod{
+					ObjectMeta: api.ObjectMeta{
+						Name: podName,
+						Namespace: ns,
+						Labels: map[string]string{"rcName": rcName},
+					},
+				})
+			}
+		}
+	}
+
+	for i := 0; i < 100; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		for j:= 0; j < 10; j++ {
+			rcName := fmt.Sprintf("rc-%d", j)
+			manager.rcStore.Add(&api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{Name: rcName, Namespace: ns},
+				Spec: api.ReplicationControllerSpec{
+					Selector: map[string]string{"rcName": rcName},
+				},
+			})
+		}
+	}
+
+
+		for _, pod := range pods {
+			rc := manager.getPodController(&pod)
+			var _ *api.ReplicationController = rc
+		}
+
+}

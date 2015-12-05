@@ -20,6 +20,8 @@ import (
 	"github.com/golang/glog"
 	"k8s.io/kubernetes/pkg/api"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
+"github.com/golang/groupcache/lru"
+	"sync"
 )
 
 // updateReplicaCount attempts to update the Status.Replicas of the given controller, with a single GET/PUT retry.
@@ -53,6 +55,34 @@ func updateReplicaCount(rcClient client.ReplicationControllerInterface, controll
 			// is bound to be more interesting than the update failure.
 			return getErr
 		}
+	}
+}
+
+type lookupCache struct {
+	lock  sync.RWMutex
+	cache map[string]*lru.Cache
+}
+
+func (lc *lookupCache) Add(pod *api.Pod, rc *api.ReplicationController) {
+	lc.lock.Lock()
+	defer lc.lock.Unlock()
+	lc.cache[pod.Namespace].Add(pod.Labels, rc)
+}
+
+func (lc *lookupCache) Remove(pod *api.Pod, rc *api.ReplicationController) {
+	lc.lock.Lock()
+	defer lc.lock.Unlock()
+	lc.cache[pod.Namespace].Remove(pod.Labels)
+}
+
+func (lc *lookupCache) Get(pod *api.Pod) (*api.ReplicationController, bool){
+	lc.lock.Lock()
+	defer lc.lock.Unlock()
+	value, hit :=lc.cache[pod.Namespace].Get(pod.Labels)
+	if hit {
+		return value.(*api.ReplicationController), hit
+	} else {
+		return nil, hit
 	}
 }
 

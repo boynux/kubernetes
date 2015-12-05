@@ -36,6 +36,9 @@ import (
 	"k8s.io/kubernetes/pkg/util"
 	"k8s.io/kubernetes/pkg/util/workqueue"
 	"k8s.io/kubernetes/pkg/watch"
+	"github.com/golang/groupcache/lru"
+	"fmt"
+	"strings"
 )
 
 const (
@@ -54,6 +57,8 @@ const (
 
 	// The number of times we retry updating a replication controller's status.
 	statusUpdateRetries = 1
+
+	maxEntries = 1024
 )
 
 // ReplicationManager is responsible for synchronizing ReplicationController objects stored
@@ -84,6 +89,12 @@ type ReplicationManager struct {
 	// podStoreSynced returns true if the pod store has been synced at least once.
 	// Added as a member to the struct to allow injection for testing.
 	podStoreSynced func() bool
+
+	lookupCache lookupCache
+
+	removedRcs map[*api.ReplicationController]bool
+
+	removedRcLock  sync.RWMutex
 
 	// Controllers that need to be synced
 	queue *workqueue.Type
@@ -143,7 +154,11 @@ func NewReplicationManager(kubeClient client.Interface, resyncPeriod controller.
 			// This will enter the sync loop and no-op, because the controller has been deleted from the store.
 			// Note that deleting a controller immediately after scaling it to 0 will not work. The recommended
 			// way of achieving this is by performing a `stop` operation on the controller.
-			DeleteFunc: rm.enqueueController,
+			DeleteFunc: func(obj interface{}) {
+				rm.enqueueController(obj)
+				rc := obj.(*api.ReplicationController)
+				rm.removedRcs[rc] = true
+			},
 		},
 	)
 
@@ -170,6 +185,10 @@ func NewReplicationManager(kubeClient client.Interface, resyncPeriod controller.
 
 	rm.syncHandler = rm.syncReplicationController
 	rm.podStoreSynced = rm.podController.HasSynced
+
+	rm.lookupCache = lookupCache{cache: make(map[string]*lru.Cache) }
+	rm.removedRcs = make(map[*api.ReplicationController]bool)
+
 	return rm
 }
 
@@ -194,9 +213,52 @@ func (rm *ReplicationManager) Run(workers int, stopCh <-chan struct{}) {
 	rm.queue.ShutDown()
 }
 
-// getPodController returns the controller managing the given pod.
-// TODO: Surface that we are ignoring multiple controllers for a single pod.
+
 func (rm *ReplicationManager) getPodController(pod *api.Pod) *api.ReplicationController {
+	//fmt.Println("get pod controller")
+	var cachedRc *api.ReplicationController
+	var hit bool
+
+	if rm.lookupCache.cache[pod.Namespace] != nil {
+		value, hit := rm.lookupCache.cache[pod.Namespace].Get(labelsHash(pod.Labels))
+		cachedRc, _ = value.(*api.ReplicationController)
+		if hit && rm.removedRcs[cachedRc] != true {
+			fmt.Println("haha: cache hit!")
+			return cachedRc
+		}
+	}
+	rc := rm.getPodControllerInterval(pod)
+	// fmt.Printf("%v", rc)
+	fmt.Println("cache not hit!")
+	if !hit || rm.removedRcs[cachedRc] == true {
+		if rm.lookupCache.cache[pod.Namespace] == nil {
+			rm.lookupCache.cache[pod.Namespace] = lru.New(32)
+		}
+		rm.lookupCache.cache[pod.Namespace].Add(labelsHash(pod.Labels), rc)
+
+		rm.removedRcLock.Lock()
+		rm.removedRcs[cachedRc] = false
+		rm.removedRcLock.Unlock()
+	}
+	return rc
+}
+
+func labelsHash(labels map[string]string) string {
+	list := []string{}
+	for k, v := range labels {
+		list = append(list, k + "-" + v)
+	}
+
+	sort.Sort(sort.StringSlice(list))
+
+	return strings.Join(list, "@")
+}
+
+
+// getPodController takes a pod and returns the controller managing the given pod by scan all the rcs to
+// find the one which matching the labels of the pod.
+// TODO: Surface that we are ignoring multiple controllers for a single pod.
+func (rm *ReplicationManager) getPodControllerInterval(pod *api.Pod) *api.ReplicationController {
 	controllers, err := rm.rcStore.GetPodControllers(pod)
 	if err != nil {
 		glog.V(4).Infof("No controllers found for pod %v, replication manager will avoid syncing", pod.Name)
