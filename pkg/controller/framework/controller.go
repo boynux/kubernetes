@@ -24,6 +24,7 @@ import (
 	"k8s.io/kubernetes/pkg/runtime"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/util/wait"
+	"reflect"
 )
 
 // Config contains all the settings for a Controller.
@@ -155,6 +156,22 @@ type ResourceEventHandler interface {
 	OnDelete(obj interface{})
 }
 
+type SyncAwareResourceEventHandler interface {
+	ResourceEventHandler
+	OnSync(obj interface{})
+}
+
+type SyncAwareResourceEventHandlerFuncs struct {
+	ResourceEventHandlerFuncs
+	SyncFunc func(obj interface{})
+}
+
+func (r SyncAwareResourceEventHandlerFuncs) OnSync(obj interface{}) {
+	if r.SyncFunc != nil {
+		r.SyncFunc(obj)
+	}
+}
+
 // ResourceEventHandlerFuncs is an adaptor to let you easily specify as many or
 // as few of the notification functions as you want while still implementing
 // ResourceEventHandler.
@@ -260,6 +277,60 @@ func NewInformer(
 	return clientState, New(cfg)
 }
 
+func NewSyncAwareInformer(
+	lw cache.ListerWatcher,
+	objType runtime.Object,
+	resyncPeriod time.Duration,
+	h SyncAwareResourceEventHandler,
+) (cache.Store, *Controller) {
+	// This will hold the client state, as we know it.
+	clientState := cache.NewStore(DeletionHandlingMetaNamespaceKeyFunc)
+
+	// This will hold incoming changes. Note how we pass clientState in as a
+	// KeyLister, that way resync operations will result in the correct set
+	// of update/delete deltas.
+	fifo := cache.NewDeltaFIFO(cache.MetaNamespaceKeyFunc, nil, clientState)
+
+	cfg := &Config{
+		Queue:            fifo,
+		ListerWatcher:    lw,
+		ObjectType:       objType,
+		FullResyncPeriod: resyncPeriod,
+		RetryOnError:     false,
+
+		Process: func(obj interface{}) error {
+			// from oldest to newest
+			for _, d := range obj.(cache.Deltas) {
+				switch d.Type {
+				case cache.Sync, cache.Added, cache.Updated:
+					if old, exists, err := clientState.Get(d.Object); err == nil && exists {
+						if !reflect.DeepEqual(old, d.Object) {
+							if err := clientState.Update(d.Object); err != nil {
+								return err
+							}
+							h.OnUpdate(old, d.Object)
+						} else {
+							h.OnSync(d.Object)
+						}
+					} else {
+						if err := clientState.Add(d.Object); err != nil {
+							return err
+						}
+						h.OnAdd(d.Object)
+					}
+				case cache.Deleted:
+					if err := clientState.Delete(d.Object); err != nil {
+						return err
+					}
+					h.OnDelete(d.Object)
+				}
+			}
+			return nil
+		},
+	}
+	return clientState, New(cfg)
+}
+
 // NewIndexerInformer returns a cache.Indexer and a controller for populating the index
 // while also providing event notifications. You should only used the returned
 // cache.Index for Get/List operations; Add/Modify/Deletes will cause the event
@@ -307,6 +378,61 @@ func NewIndexerInformer(
 							return err
 						}
 						h.OnUpdate(old, d.Object)
+					} else {
+						if err := clientState.Add(d.Object); err != nil {
+							return err
+						}
+						h.OnAdd(d.Object)
+					}
+				case cache.Deleted:
+					if err := clientState.Delete(d.Object); err != nil {
+						return err
+					}
+					h.OnDelete(d.Object)
+				}
+			}
+			return nil
+		},
+	}
+	return clientState, New(cfg)
+}
+
+func NewSyncAwareIndexerInformer(
+	lw cache.ListerWatcher,
+	objType runtime.Object,
+	resyncPeriod time.Duration,
+	h SyncAwareResourceEventHandler,
+	indexers cache.Indexers,
+) (cache.Indexer, *Controller) {
+	// This will hold the client state, as we know it.
+	clientState := cache.NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers)
+
+	// This will hold incoming changes. Note how we pass clientState in as a
+	// KeyLister, that way resync operations will result in the correct set
+	// of update/delete deltas.
+	fifo := cache.NewDeltaFIFO(cache.MetaNamespaceKeyFunc, nil, clientState)
+
+	cfg := &Config{
+		Queue:            fifo,
+		ListerWatcher:    lw,
+		ObjectType:       objType,
+		FullResyncPeriod: resyncPeriod,
+		RetryOnError:     false,
+
+		Process: func(obj interface{}) error {
+			// from oldest to newest
+			for _, d := range obj.(cache.Deltas) {
+				switch d.Type {
+				case cache.Sync, cache.Added, cache.Updated:
+					if old, exists, err := clientState.Get(d.Object); err == nil && exists {
+						if !reflect.DeepEqual(old, d.Object) {
+							if err := clientState.Update(d.Object); err != nil {
+								return err
+							}
+							h.OnUpdate(old, d.Object)
+						} else {
+							h.OnSync(d.Object)
+						}
 					} else {
 						if err := clientState.Add(d.Object); err != nil {
 							return err
