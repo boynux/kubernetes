@@ -105,6 +105,8 @@ type ReplicationManager struct {
 
 	// Controllers that need to be synced
 	queue *workqueue.Type
+
+	queueForSync *workqueue.Type
 }
 
 // NewReplicationManager creates a replication manager
@@ -182,7 +184,11 @@ func newReplicationManagerInternal(eventRecorder record.EventRecorder, podInform
 				if oldRC.Status.Replicas != curRC.Status.Replicas {
 					glog.V(4).Infof("Observed updated replica count for rc: %v, %d->%d", curRC.Name, oldRC.Status.Replicas, curRC.Status.Replicas)
 				}
-				rm.enqueueController(cur)
+				if !reflect.DeepEqual(old, cur) {
+					rm.enqueueControllerForSync(cur)
+				} else {
+					rm.enqueueController(cur)
+				}
 			},
 			// This will enter the sync loop and no-op, because the controller has been deleted from the store.
 			// Note that deleting a controller immediately after scaling it to 0 will not work. The recommended
@@ -242,6 +248,9 @@ func (rm *ReplicationManager) Run(workers int, stopCh <-chan struct{}) {
 	go rm.podController.Run(stopCh)
 	for i := 0; i < workers; i++ {
 		go wait.Until(rm.worker, time.Second, stopCh)
+	}
+	for i := 0; i < workers; i++ {
+		go wait.Until(rm.workerForSync, time.Second, stopCh)
 	}
 
 	if rm.internalPodInformer != nil {
@@ -429,6 +438,22 @@ func (rm *ReplicationManager) enqueueController(obj interface{}) {
 	rm.queue.Add(key)
 }
 
+func (rm *ReplicationManager) enqueueControllerForSync(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		return
+	}
+
+	// TODO: Handle overlapping controllers better. Either disallow them at admission time or
+	// deterministically avoid syncing controllers that fight over pods. Currently, we only
+	// ensure that the same controller is synced for a given pod. When we periodically relist
+	// all controllers there will still be some replica instability. One way to handle this is
+	// by querying the store for all controllers that this rc overlaps, as well as all
+	// controllers that overlap this rc, and sorting them.
+	rm.queueForSync.Add(key)
+}
+
 // worker runs a worker thread that just dequeues items, processes them, and marks them done.
 // It enforces that the syncHandler is never invoked concurrently with the same key.
 func (rm *ReplicationManager) worker() {
@@ -438,6 +463,27 @@ func (rm *ReplicationManager) worker() {
 			return true
 		}
 		defer rm.queue.Done(key)
+		err := rm.syncHandler(key.(string))
+		if err != nil {
+			glog.Errorf("Error syncing replication controller: %v", err)
+		}
+		return false
+	}
+	for {
+		if quit := workFunc(); quit {
+			glog.Infof("replication controller worker shutting down")
+			return
+		}
+	}
+}
+
+func (rm *ReplicationManager) workerForSync() {
+	workFunc := func() bool {
+		key, quit := rm.queueForSync.Get()
+		if quit {
+			return true
+		}
+		defer rm.queueForSync.Done(key)
 		err := rm.syncHandler(key.(string))
 		if err != nil {
 			glog.Errorf("Error syncing replication controller: %v", err)
