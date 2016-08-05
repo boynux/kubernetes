@@ -15,6 +15,7 @@
 # This file creates a standard build environment for building Kubernetes
 FROM gcr.io/google_containers/kube-cross:KUBE_BUILD_IMAGE_CROSS_TAG
 
+RUN apt-get update && apt-get install -y -q libnl-3-dev libnl-genl-3-dev
 # Mark this as a kube-build container
 RUN touch /kube-build-image
 
